@@ -2,6 +2,10 @@
 
 An AI-powered agent that helps cyclists plan multi-day bike trips through natural conversation. Built with FastAPI, Claude (Anthropic), Pydantic, and a Streamlit frontend with interactive maps.
 
+## Link to Video Recording
+
+https://drive.google.com/file/d/1zkBkCdIxlxHCycWWEPDTQsCIY1WcHb67/view?usp=share_link
+
 ## Quick Start
 
 ```bash
