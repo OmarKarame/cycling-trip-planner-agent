@@ -34,13 +34,17 @@ The API will be available at `http://localhost:8000`. The chat UI will open at `
 ## Features
 
 - **Conversational trip planning** — Chat naturally about your cycling trip and the agent gathers your preferences, then builds a complete day-by-day itinerary.
+- **Auto-chained tool execution** — When the user provides enough info upfront (route + month), the server auto-chains weather, elevation, and accommodation after the route call, reducing API round-trips from ~8 to 2. Falls back to the normal multi-turn loop when info is incomplete.
+- **Per-day weather forecasts** — Weather tool supports a `days` parameter that generates daily forecasts with temperature, rain chance, wind, and conditions for each day of the trip.
+- **Per-day accommodation** — Every overnight stop along the route gets accommodation options — no day is left without a place to stay.
 - **Preference confirmation gate** — Before planning, the agent must confirm daily distance, daily budget, accommodation type, and difficulty. If values are missing, it asks the user to confirm defaults or provide custom values.
 - **New-trip preference reuse** — When a new trip starts in the same session, the agent asks whether to reuse the previous trip's preferences.
-- **Flexible preference parsing** — Understands natural phrasing (e.g. `around 100km a day`), mixed accommodation patterns (`camping but hostel every 4th night`), and travel timing expressions.
+- **Flexible preference parsing** — Understands natural phrasing (e.g. `around 100km a day`), mixed accommodation patterns (`camping but hostel every 4th night`), and travel timing expressions (months, seasons).
 - **Interactive map** — Route line with clickable waypoint markers showing weather, accommodation, and day info. Expandable day-by-day details below the map.
 - **Weather safety checks** — The agent assesses weather conditions before presenting any plan, warning about rain, extreme temperatures, or strong winds.
 - **7 planning tools** — 4 core (route, weather, elevation, accommodation) + 3 optional bonus tools (points of interest, visa requirements, budget estimation).
 - **Server-side guardrails** — Tool ordering is enforced: route must be fetched before other tools, weather before accommodation.
+- **Session expiry detection** — When a session expires (e.g. server restart), the user gets a warning and a fresh session instead of a confusing context-free response.
 - **Swap-ready architecture** — All tools use Python Protocol classes, so mock implementations can be replaced with real APIs without changing calling code.
 
 ## Pre-Built Routes
@@ -92,16 +96,16 @@ main.py               # Uvicorn entrypoint
 src/
   models.py           # All Pydantic models (route, weather, accommodation, etc.)
   agent/              # Agent logic
-    orchestrator.py   # Core loop: Claude API calls, tool interception, response handling
-    planner_policy.py # Deterministic planning slots + core-tool completion policy
+    orchestrator.py   # Hybrid loop: Claude API calls, auto-chaining, guardrails
+    planner_policy.py # Deterministic planning slots + constraint injection
     guardrails.py     # Server-side tool ordering validation
-    session.py        # In-memory conversation state per session
+    session.py        # In-memory conversation state with TTL expiry
     system_prompt.py  # Agent persona and planning instructions
     tool_definitions.py # Claude tool_use schema definitions
   tools/              # Swap-ready tool system
     protocol.py       # Protocol interfaces (structural subtyping)
     mock_route.py     # Mock route provider (12 pre-built European routes)
-    mock_weather.py   # Mock weather provider (seasonal data)
+    mock_weather.py   # Mock weather provider (seasonal data + daily forecasts)
     mock_accommodation.py # Mock accommodation (camping, hostel, hotel)
     mock_elevation.py # Mock elevation/difficulty profiles
     mock_poi.py       # Mock points of interest
@@ -111,7 +115,7 @@ src/
     app.py            # App factory
     routes.py         # POST /chat endpoint
     dependencies.py   # Dependency injection
-tests/                # 106 pytest tests
+tests/                # 110 pytest tests
 ```
 
 ### Tools
@@ -121,7 +125,7 @@ tests/                # 106 pytest tests
 | Tool | Description |
 |------|-------------|
 | `get_route` | Cycling route with waypoints, distance, and estimated days |
-| `get_weather` | Weather conditions for a location in a given month |
+| `get_weather` | Weather conditions for a location in a given month, with optional per-day forecasts |
 | `get_elevation_profile` | Terrain difficulty, elevation gain, and max elevation |
 | `find_accommodation` | Camping, hostel, and hotel options with prices and ratings |
 
@@ -135,21 +139,17 @@ tests/                # 106 pytest tests
 
 ### Key Design Decisions
 
-**Hybrid orchestration** — Claude decides which tools to call via the tool_use API, but the server intercepts every tool call to apply guardrails before execution. This gives Claude's conversational flexibility with server-side ordering guarantees.
+**Hybrid orchestration with auto-chaining** — The orchestrator runs a manual tool loop (Claude picks tools → server intercepts → guardrails validate → execute → return results). On top of this, a **fast path** detects when Claude calls `get_route` with enough context (travel month is known) and auto-chains weather, elevation, and accommodation server-side in a single step. This reduces API round-trips from ~8 to 2 while preserving the normal multi-turn loop as a fallback when the month isn't known yet. The guardrail ordering (route → weather → accommodation) is enforced structurally in the auto-chain code path, and at runtime via the `ToolGuardrails` class in the fallback path.
 
 **Swap-ready tools** — Each tool is defined as a Python `Protocol` (structural subtyping). Mock implementations can be replaced with real API clients (Google Maps, OpenWeatherMap, etc.) without changing any calling code — the new class just needs to implement the same method signature.
 
-**In-memory sessions** — Conversation state is stored in a dict keyed by session ID. Simple for the current scope; can be swapped to SQLite or Redis when persistence is needed.
-
-**Manual tool loop** — Instead of using an auto-executing tool runner, the orchestrator manually loops: call Claude → intercept tool requests → validate via guardrails → execute → send results back. This is required for the guardrail interception step. A max-turns safety net (15 iterations) prevents infinite loops.
+**In-memory sessions with expiry detection** — Conversation state is stored in a dict keyed by session ID with a 1-hour TTL. When a session expires (e.g. after server restart), the API detects it and prepends a warning to the response instead of silently losing context.
 
 **Data-driven dispatch** — Tool routing uses a declarative registry (`_TOOL_DISPATCH`) mapping tool names to their input model, provider, method, and session flag. Adding a new tool is a single dict entry rather than a new code branch.
 
-**Session lifecycle** — Sessions track a `last_active` timestamp and are automatically cleaned up after 1 hour of inactivity, preventing memory leaks in long-running deployments.
-
 **Context window management** — The orchestrator trims conversation history to a rolling window of 40 messages, preserving the first user message (trip context) and the most recent turns.
 
-**Deterministic policy layer** — In addition to prompt guidance, the server extracts typed planning slots (`start`, `end`, `month`, daily distance, daily budget, accommodation strategy, difficulty), enforces preference confirmation before planning, clarifies approximate travel timing (e.g. seasons), and enforces missing required core tools before allowing a final itinerary response.
+**Deterministic policy layer** — The server extracts typed planning slots (`start`, `end`, `month`, daily distance, daily budget, accommodation strategy, difficulty) from user messages and tool calls. These are injected into the system prompt as structured constraints and used to pre-fill tool inputs, ensuring consistency between what the user said and what the tools receive. A max-turns safety net (15 iterations) prevents infinite loops.
 
 ## API Response & Frontend Data
 
@@ -182,16 +182,20 @@ The `POST /chat` endpoint returns a `ChatResponse` with four fields:
 }
 ```
 
-**`get_weather`** — List of weather results (one per location checked):
+**`get_weather`** — List of weather results (one per location checked). When the `days` parameter is provided, includes `daily_forecasts` with per-day weather:
 ```json
 [
   {
     "location": "Amsterdam",
-    "month": "june",
+    "month": 7,
     "avg_temp_celsius": 17.5,
     "rain_chance_percent": 35.0,
     "wind_speed_kmh": 18.0,
-    "summary": "Mild and pleasant with occasional showers."
+    "summary": "Mild and pleasant with occasional showers.",
+    "daily_forecasts": [
+      { "day": 1, "avg_temp_celsius": 18.2, "rain_chance_percent": 30.0, "wind_speed_kmh": 16.5, "summary": "Warm and mostly sunny" },
+      { "day": 2, "avg_temp_celsius": 17.1, "rain_chance_percent": 40.0, "wind_speed_kmh": 19.0, "summary": "Mild with light clouds" }
+    ]
   }
 ]
 ```
@@ -295,7 +299,7 @@ The `POST /chat` endpoint returns a `ChatResponse` with four fields:
 
 ```bash
 pytest tests/ -v
-# 106 tests covering models, tools, guardrails, planner policy, orchestrator multi-step flow, and API endpoints
+# 110 tests covering models, tools, guardrails, planner policy, orchestrator, and API endpoints
 ```
 
 ### Test Coverage
@@ -303,11 +307,11 @@ pytest tests/ -v
 | Test File | Count | What It Covers |
 |-----------|-------|----------------|
 | `test_models.py` | 21 | Pydantic model validation, field bounds, enum values, defaults |
-| `test_tools.py` | 34 | All 7 mock tool providers, protocol compliance, filtering logic |
+| `test_tools.py` | 34 | All 7 mock tool providers, protocol compliance, filtering logic, daily forecasts |
 | `test_guardrails.py` | 12 | Tool ordering rules — what's blocked and when |
-| `test_orchestrator.py` | 22 | **Multi-step reasoning**: full planning flow across 4+ tool calls, guardrail self-correction, deterministic preference confirmation, travel timing clarification, structured constraints, deterministic core-tool enforcement, session state accumulation, max-turns safety, error handling, message history |
-| `test_planner_policy.py` | 13 | Slot extraction, mixed accommodation parsing, travel timing parsing, confirmation parsing, defaults, input enrichment, and core-tool completion policy |
-| `test_api.py` | 4 | API endpoint, session persistence, response format, validation errors |
+| `test_orchestrator.py` | 22 | Full planning flow with auto-chain, fallback to normal loop, auto-chain content verification, accommodation type propagation, guardrail self-correction, session state accumulation, max-turns safety, error handling, message history |
+| `test_planner_policy.py` | 8 | Slot extraction, mixed accommodation parsing, travel timing parsing, input enrichment, constraint building |
+| `test_api.py` | 5 | API endpoint, session persistence, session expiry warning, response format, validation errors |
 
 ## What I Would Build With More Time
 
@@ -316,4 +320,4 @@ pytest tests/ -v
 - **Streaming responses** — Use Claude's streaming API + SSE to stream the agent's response in real-time.
 - **Trip export** — GPX file export for loading routes into cycling GPS devices.
 - **User accounts** — Save and revisit past trip plans.
-- **Personalised customisation** — Make trip customisable by adding stops along the way or changing the countries that the user crosses through on the way to the destination
+- **Multi-stop trips** — Support intermediate stops (e.g. "London to Copenhagen via Amsterdam") by computing separate route legs and presenting as one unified trip.

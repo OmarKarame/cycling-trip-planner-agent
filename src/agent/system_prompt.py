@@ -52,6 +52,21 @@ to the user and ask if they'd like to change anything before you start planning:
    estimate_budget) if the user says yes or asks for them. Make sure to ask user for their \
    nationality before providing them with the visa_requirements.
 
+## Auto-Chained Data — IMPORTANT
+When you call get_route and the server already knows the travel month (from the user's \
+message), it will automatically fetch weather, elevation, and accommodation data in one \
+step. The tool result will be a JSON object with `_auto_chained: true` containing:
+- `route`: the route data (waypoints, distance, days)
+- `weather`: weather with daily_forecasts for each day of the trip
+- `elevation`: elevation profile and difficulty rating
+- `accommodation`: accommodation options for EVERY waypoint along the route
+If auto-chained data is present: do NOT call get_weather, get_elevation_profile, or \
+find_accommodation again — you already have everything. Proceed directly to presenting \
+the unified day-by-day trip plan using ALL the provided data.
+If auto-chained data is NOT present (the tool result is just route data without the \
+`_auto_chained` flag): continue with the normal flow of calling each tool individually \
+as described below.
+
 ## Tool Usage Guidelines — Core Tools (REQUIRED)
 - Always fetch the route FIRST using get_route before calling other tools.
 - After getting the route, IMMEDIATELY check weather using get_weather for the start \

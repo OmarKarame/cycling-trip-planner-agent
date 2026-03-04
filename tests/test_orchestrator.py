@@ -82,63 +82,15 @@ class TestMultiStepPlanning:
     """Verify the agent executes a full planning flow across multiple loop iterations."""
 
     @pytest.mark.asyncio
-    async def test_full_planning_flow_four_tools(self, orchestrator, session):
-        """Claude calls route → weather (with daily forecasts) → elevation →
-        accommodation (for every overnight stop), then produces a final text response."""
+    async def test_full_planning_flow_with_auto_chain(self, orchestrator, session):
+        """When month is known, get_route auto-chains weather + elevation +
+        accommodation server-side, so Claude only needs 2 API calls."""
         orchestrator.client.messages.create = AsyncMock(
             side_effect=[
                 _tool_use_response(
                     _tool_use_block("get_route", {
                         "start": "Amsterdam", "end": "Copenhagen",
                     })
-                ),
-                _tool_use_response(
-                    _tool_use_block("get_weather", {
-                        "location": "Amsterdam", "month": 7, "days": 8,
-                    })
-                ),
-                _tool_use_response(
-                    _tool_use_block("get_weather", {
-                        "location": "Hamburg", "month": 7,
-                    })
-                ),
-                _tool_use_response(
-                    _tool_use_block("get_elevation_profile", {
-                        "start": "Amsterdam", "end": "Copenhagen",
-                    })
-                ),
-                # Accommodation for every overnight stop
-                _tool_use_response(
-                    _tool_use_block("find_accommodation", {
-                        "location": "Amersfoort",
-                    }, "acc_1"),
-                    _tool_use_block("find_accommodation", {
-                        "location": "Zwolle",
-                    }, "acc_2"),
-                ),
-                _tool_use_response(
-                    _tool_use_block("find_accommodation", {
-                        "location": "Emmen",
-                    }, "acc_3"),
-                    _tool_use_block("find_accommodation", {
-                        "location": "Bremen",
-                    }, "acc_4"),
-                ),
-                _tool_use_response(
-                    _tool_use_block("find_accommodation", {
-                        "location": "Hamburg",
-                    }, "acc_5"),
-                    _tool_use_block("find_accommodation", {
-                        "location": "Lübeck",
-                    }, "acc_6"),
-                ),
-                _tool_use_response(
-                    _tool_use_block("find_accommodation", {
-                        "location": "Fehmarn",
-                    }, "acc_7"),
-                    _tool_use_block("find_accommodation", {
-                        "location": "Rødby",
-                    }, "acc_8"),
                 ),
                 _final_response("Here is your 8-day cycling trip plan..."),
             ]
@@ -151,24 +103,26 @@ class TestMultiStepPlanning:
         )
 
         assert "cycling trip plan" in result
-        assert orchestrator.client.messages.create.call_count == 9
-        assert session.tools_used_this_turn == [
-            "get_route",
-            "get_weather",
-            "get_weather",
-            "get_elevation_profile",
-            "find_accommodation",
-            "find_accommodation",
-            "find_accommodation",
-            "find_accommodation",
-            "find_accommodation",
-            "find_accommodation",
-            "find_accommodation",
-            "find_accommodation",
-        ]
-        # All accommodation results accumulated
+        # Only 2 API calls: get_route (with auto-chain) + final response
+        assert orchestrator.client.messages.create.call_count == 2
+        # Auto-chain executed all tools server-side
+        assert "get_route" in session.tools_used_this_turn
+        assert "get_weather" in session.tools_used_this_turn
+        assert "get_elevation_profile" in session.tools_used_this_turn
+        assert "find_accommodation" in session.tools_used_this_turn
+        # All session flags set
+        assert session.route_fetched is True
+        assert session.weather_fetched is True
+        assert session.elevation_fetched is True
+        assert session.accommodation_fetched is True
+        # Data stored for UI
+        assert "get_route" in session.tool_results_data
+        assert "get_weather" in session.tool_results_data
+        assert "get_elevation_profile" in session.tool_results_data
+        assert "find_accommodation" in session.tool_results_data
+        # Accommodation for every waypoint
         acc_data = session.tool_results_data["find_accommodation"]
-        assert len(acc_data) == 8
+        assert len(acc_data) >= 8
 
     @pytest.mark.asyncio
     async def test_session_flags_set_after_each_tool(self, orchestrator, session):
@@ -264,6 +218,112 @@ class TestMultiStepPlanning:
         assert "get_elevation_profile" in session.tools_used_this_turn
         assert session.weather_fetched is True
         assert session.elevation_fetched is True
+
+
+# ── Auto-chain fast path ───────────────────────────────────────────
+
+
+class TestAutoChain:
+    """Verify auto-chaining of weather + elevation + accommodation after get_route."""
+
+    @pytest.mark.asyncio
+    async def test_auto_chain_skipped_when_month_unknown(self, orchestrator, session):
+        """Without a month, auto-chain doesn't fire and the normal loop continues."""
+        orchestrator.client.messages.create = AsyncMock(
+            side_effect=[
+                _tool_use_response(
+                    _tool_use_block("get_route", {"start": "A", "end": "B"})
+                ),
+                _tool_use_response(
+                    _tool_use_block("get_weather", {"location": "A", "month": 6})
+                ),
+                _final_response("Done"),
+            ]
+        )
+
+        await orchestrator.chat("Plan from A to B", session)
+
+        # Route fetched normally, weather fetched via normal loop
+        assert session.route_fetched is True
+        assert session.weather_fetched is True
+        # No auto-chain — elevation and accommodation not auto-fetched
+        assert session.elevation_fetched is False
+        assert session.accommodation_fetched is False
+
+    @pytest.mark.asyncio
+    async def test_auto_chain_accommodation_matches_waypoints(self, orchestrator, session):
+        """Auto-chain creates one accommodation entry per route waypoint."""
+        orchestrator.client.messages.create = AsyncMock(
+            side_effect=[
+                _tool_use_response(
+                    _tool_use_block("get_route", {
+                        "start": "Amsterdam", "end": "Copenhagen",
+                    })
+                ),
+                _final_response("Here's your plan."),
+            ]
+        )
+
+        await orchestrator.chat(
+            "Plan Amsterdam to Copenhagen in July", session
+        )
+
+        route_data = session.tool_results_data["get_route"]
+        acc_data = session.tool_results_data["find_accommodation"]
+        assert len(acc_data) == len(route_data["waypoints"])
+
+    @pytest.mark.asyncio
+    async def test_auto_chain_uses_slot_accommodation_type(self, orchestrator, session):
+        """Auto-chain passes the user's accommodation preference to find_accommodation."""
+        session.planning_slots.accommodation_type = AccommodationType.CAMPING
+        session.planning_slots.month = 8
+
+        orchestrator.client.messages.create = AsyncMock(
+            side_effect=[
+                _tool_use_response(
+                    _tool_use_block("get_route", {
+                        "start": "Amsterdam", "end": "Copenhagen",
+                    })
+                ),
+                _final_response("Plan ready."),
+            ]
+        )
+
+        await orchestrator.chat("Go", session)
+
+        # All accommodation results should be filtered to camping
+        acc_data = session.tool_results_data["find_accommodation"]
+        for entry in acc_data:
+            for acc in entry["accommodations"]:
+                assert acc["type"] == "camping"
+
+    @pytest.mark.asyncio
+    async def test_auto_chain_content_has_flag(self, orchestrator, session):
+        """The enriched tool result contains the _auto_chained flag."""
+        orchestrator.client.messages.create = AsyncMock(
+            side_effect=[
+                _tool_use_response(
+                    _tool_use_block("get_route", {
+                        "start": "Amsterdam", "end": "Copenhagen",
+                    })
+                ),
+                _final_response("Done."),
+            ]
+        )
+
+        await orchestrator.chat(
+            "Plan Amsterdam to Copenhagen in July", session
+        )
+
+        # Check the tool result message sent back to Claude
+        tool_result_msg = session.messages[2]  # user → assistant(tool_use) → user(tool_result)
+        import json
+        content = json.loads(tool_result_msg["content"][0]["content"])
+        assert content["_auto_chained"] is True
+        assert "route" in content
+        assert "weather" in content
+        assert "elevation" in content
+        assert "accommodation" in content
 
 
 class TestSlotInjection:

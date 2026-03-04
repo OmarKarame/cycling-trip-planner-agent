@@ -1,3 +1,4 @@
+import json
 import logging
 
 import anthropic
@@ -166,6 +167,19 @@ class AgentOrchestrator:
             result = self._dispatch_tool(tool_name, effective_input, session)
             session.tools_used_this_turn.append(tool_name)
             self._store_tool_result(tool_name, result, session)
+
+            # Fast path: auto-chain weather + elevation + accommodation after route
+            if tool_name == "get_route":
+                chained = self._auto_chain_after_route(
+                    result, effective_input, session
+                )
+                if chained is not None:
+                    return {
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "content": chained,
+                    }
+
             return {
                 "type": "tool_result",
                 "tool_use_id": tool_use_id,
@@ -196,6 +210,83 @@ class AgentOrchestrator:
             setattr(session, session_flag, True)
 
         return result
+
+    def _auto_chain_after_route(
+        self, route_result, route_input: dict, session: SessionState
+    ) -> str | None:
+        """Auto-execute weather + elevation + accommodation after get_route.
+
+        Returns enriched JSON content for Claude, or None to fall back to the
+        normal tool loop (e.g. when month is unknown).
+        """
+        slots = session.planning_slots
+        if slots.month is None:
+            return None
+
+        combined: dict = {
+            "_auto_chained": True,
+            "route": route_result.model_dump(),
+        }
+
+        # Weather (with daily forecasts)
+        try:
+            weather_input = WeatherInput(
+                location=route_input["start"],
+                month=slots.month,
+                days=route_result.estimated_days,
+            )
+            weather_result = self.tools.weather.get_weather(weather_input)
+            session.weather_fetched = True
+            self._store_tool_result("get_weather", weather_result, session)
+            session.tools_used_this_turn.append("get_weather")
+            combined["weather"] = weather_result.model_dump()
+        except Exception as e:
+            logger.warning("Auto-chain weather failed: %s", e)
+            combined["weather_error"] = str(e)
+
+        # Elevation profile
+        try:
+            elevation_input = ElevationInput(
+                start=route_input["start"],
+                end=route_input["end"],
+            )
+            elevation_result = self.tools.elevation.get_elevation_profile(
+                elevation_input
+            )
+            session.elevation_fetched = True
+            self._store_tool_result(
+                "get_elevation_profile", elevation_result, session
+            )
+            session.tools_used_this_turn.append("get_elevation_profile")
+            combined["elevation"] = elevation_result.model_dump()
+        except Exception as e:
+            logger.warning("Auto-chain elevation failed: %s", e)
+            combined["elevation_error"] = str(e)
+
+        # Accommodation for every waypoint
+        try:
+            acc_results = []
+            acc_type = slots.accommodation_type
+            for wp in route_result.waypoints:
+                acc_input = AccommodationInput(
+                    location=wp.name,
+                    accommodation_type=acc_type,
+                )
+                acc_result = self.tools.accommodation.find_accommodation(
+                    acc_input
+                )
+                self._store_tool_result(
+                    "find_accommodation", acc_result, session
+                )
+                session.tools_used_this_turn.append("find_accommodation")
+                acc_results.append(acc_result.model_dump())
+            session.accommodation_fetched = True
+            combined["accommodation"] = acc_results
+        except Exception as e:
+            logger.warning("Auto-chain accommodation failed: %s", e)
+            combined["accommodation_error"] = str(e)
+
+        return json.dumps(combined)
 
     @staticmethod
     def _store_tool_result(tool_name: str, result, session: SessionState) -> None:
