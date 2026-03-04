@@ -3,10 +3,16 @@ from typing import Protocol, runtime_checkable
 from src.models import (
     AccommodationInput,
     AccommodationOutput,
+    BudgetInput,
+    BudgetOutput,
     ElevationInput,
     ElevationOutput,
+    POIInput,
+    POIOutput,
     RouteInput,
     RouteOutput,
+    VisaInput,
+    VisaOutput,
     WeatherInput,
     WeatherOutput,
 )
@@ -30,3 +36,18 @@ class WeatherProvider(Protocol):
 @runtime_checkable
 class ElevationProvider(Protocol):
     def get_elevation_profile(self, input: ElevationInput) -> ElevationOutput: ...
+
+
+@runtime_checkable
+class POIProvider(Protocol):
+    def get_points_of_interest(self, input: POIInput) -> POIOutput: ...
+
+
+@runtime_checkable
+class VisaProvider(Protocol):
+    def check_visa_requirements(self, input: VisaInput) -> VisaOutput: ...
+
+
+@runtime_checkable
+class BudgetProvider(Protocol):
+    def estimate_budget(self, input: BudgetInput) -> BudgetOutput: ...

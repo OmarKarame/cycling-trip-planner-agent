@@ -70,6 +70,18 @@ class TestWeatherModels:
         with pytest.raises(ValidationError):
             WeatherInput(location="Paris", month=13)
 
+    def test_days_optional(self):
+        wi = WeatherInput(location="Paris", month=6)
+        assert wi.days is None
+
+    def test_days_provided(self):
+        wi = WeatherInput(location="Paris", month=6, days=8)
+        assert wi.days == 8
+
+    def test_days_must_be_positive(self):
+        with pytest.raises(ValidationError):
+            WeatherInput(location="Paris", month=6, days=0)
+
 
 class TestElevationModels:
     def test_valid_input(self):
@@ -79,6 +91,48 @@ class TestElevationModels:
     def test_difficulty_enum_values(self):
         assert DifficultyRating.EASY.value == "easy"
         assert DifficultyRating.EXTREME.value == "extreme"
+
+
+class TestPOIModels:
+    def test_poi_input_defaults(self):
+        from src.models import POIInput
+        pi = POIInput(location="Amsterdam")
+        assert pi.radius_km == 20.0
+
+    def test_poi_category_values(self):
+        from src.models import POICategory
+        assert POICategory.HISTORICAL.value == "historical"
+        assert POICategory.VIEWPOINT.value == "viewpoint"
+
+
+class TestVisaModels:
+    def test_visa_input(self):
+        from src.models import VisaInput
+        vi = VisaInput(nationality="Dutch", countries=["Germany", "Denmark"])
+        assert len(vi.countries) == 2
+
+    def test_visa_requirement(self):
+        from src.models import VisaRequirement
+        vr = VisaRequirement(
+            country="Germany", visa_required=False,
+            notes="No visa required.",
+        )
+        assert vr.visa_type is None
+
+
+class TestBudgetModels:
+    def test_budget_input_defaults(self):
+        from src.models import BudgetInput
+        bi = BudgetInput(start="Amsterdam", end="Copenhagen", days=10)
+        assert bi.accommodation_type == AccommodationType.HOSTEL
+        assert bi.budget_level == "moderate"
+
+    def test_budget_breakdown(self):
+        from src.models import BudgetBreakdown
+        bb = BudgetBreakdown(
+            accommodation=40, food=35, transport=8, activities=10, total=93,
+        )
+        assert bb.total == 93
 
 
 class TestAPIModels:

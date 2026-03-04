@@ -1,43 +1,100 @@
+import logging
+
 import anthropic
 
 from src.agent.guardrails import ToolGuardrails
+from src.agent.planner_policy import (
+    build_planning_constraints,
+    inject_slot_defaults_into_tool_input,
+    update_slots_from_tool_call,
+    update_slots_from_user_message,
+)
 from src.agent.session import SessionState
 from src.agent.system_prompt import SYSTEM_PROMPT
 from src.agent.tool_definitions import get_tool_definitions
 from src.models import (
     AccommodationInput,
+    BudgetInput,
     ElevationInput,
+    POIInput,
     RouteInput,
+    VisaInput,
     WeatherInput,
 )
 from src.tools import ToolRegistry
 
+logger = logging.getLogger(__name__)
+
+MAX_TOOL_TURNS = 15
+
+
+# Maps tool names to (input_model, registry_attr, method_name, session_flag).
+# session_flag is the SessionState attribute to set True after execution (or None).
+_TOOL_DISPATCH: dict[str, tuple[type, str, str, str | None]] = {
+    "get_route":              (RouteInput,         "route",         "get_route",              "route_fetched"),
+    "find_accommodation":     (AccommodationInput, "accommodation", "find_accommodation",     "accommodation_fetched"),
+    "get_weather":            (WeatherInput,       "weather",       "get_weather",            "weather_fetched"),
+    "get_elevation_profile":  (ElevationInput,     "elevation",     "get_elevation_profile",  "elevation_fetched"),
+    "get_points_of_interest": (POIInput,           "poi",           "get_points_of_interest", None),
+    "check_visa_requirements":(VisaInput,          "visa",          "check_visa_requirements",None),
+    "estimate_budget":        (BudgetInput,        "budget",        "estimate_budget",        None),
+}
+
+# Tools that may be called multiple times per turn (per-waypoint or per-leg) — accumulate as lists.
+_ACCUMULATING_TOOLS = {
+    "find_accommodation", "get_weather", "get_points_of_interest",
+}
+
 
 class AgentOrchestrator:
-    """Runs the hybrid agent loop: Claude picks tools, server validates and executes."""
+    """Runs the hybrid agent loop: Claude picks tools, server validates and executes.
+
+    The server parses user preferences into structured slots and injects them as
+    system prompt constraints. Claude drives the conversation flow based on the
+    guidelines in the system prompt — the server does not hard-code dialog states.
+    """
 
     def __init__(
         self,
         tool_registry: ToolRegistry,
-        model: str = "claude-opus-4-20250514",
+        model: str = "claude-sonnet-4-20250514",
     ) -> None:
-        self.client = anthropic.Anthropic()
+        self.client = anthropic.AsyncAnthropic()
         self.model = model
         self.tools = tool_registry
         self.guardrails = ToolGuardrails()
         self.tool_definitions = get_tool_definitions(tool_registry)
 
+    @staticmethod
+    def _trim_messages(messages: list[dict], max_messages: int = 40) -> list[dict]:
+        """Keep conversation history within bounds to avoid exceeding the context window.
+
+        Preserves the first user message (trip context) and the most recent turns.
+        """
+        if len(messages) <= max_messages:
+            return messages
+        # Keep first message (initial trip description) + most recent messages
+        return messages[:1] + messages[-(max_messages - 1):]
+
     async def chat(self, user_message: str, session: SessionState) -> str:
         """Process a user message and return the agent's text response."""
         session.messages.append({"role": "user", "content": user_message})
+
+        # Parse user preferences into structured slots for system prompt injection.
+        update_slots_from_user_message(session.planning_slots, user_message)
+
         session.tools_used_this_turn = []
+        session.messages = self._trim_messages(session.messages)
+
+        logger.info("Processing message for session %s", session.session_id)
 
         # Agentic tool loop — keeps running until Claude produces a final text response
-        while True:
-            response = self.client.messages.create(
+        for turn in range(MAX_TOOL_TURNS):
+            system_prompt = SYSTEM_PROMPT + build_planning_constraints(session)
+            response = await self.client.messages.create(
                 model=self.model,
                 max_tokens=4096,
-                system=SYSTEM_PROMPT,
+                system=system_prompt,
                 tools=self.tool_definitions,
                 messages=session.messages,
             )
@@ -51,6 +108,7 @@ class AgentOrchestrator:
                 tool_results = []
                 for block in response.content:
                     if block.type == "tool_use":
+                        logger.info("Tool call: %s", block.name)
                         result = self._execute_tool(
                             block.name, block.input, block.id, session
                         )
@@ -68,10 +126,14 @@ class AgentOrchestrator:
 
             else:
                 # Unexpected stop reason — return whatever text we have
+                logger.warning("Unexpected stop reason: %s", response.stop_reason)
                 session.messages.append(
                     {"role": "assistant", "content": response.content}
                 )
                 return self._extract_text(response.content)
+
+        logger.error("Hit max tool turns (%d) for session %s", MAX_TOOL_TURNS, session.session_id)
+        return self._extract_text(response.content)
 
     def _execute_tool(
         self,
@@ -81,7 +143,7 @@ class AgentOrchestrator:
         session: SessionState,
     ) -> dict:
         """Validate and execute a single tool call."""
-        # Apply guardrails first
+        # Apply guardrails (e.g. route must be fetched before accommodation)
         is_valid, error_msg = self.guardrails.validate_tool_call(
             tool_name, tool_input, session
         )
@@ -95,14 +157,22 @@ class AgentOrchestrator:
 
         # Dispatch to the correct provider
         try:
-            result = self._dispatch_tool(tool_name, tool_input, session)
+            effective_input = inject_slot_defaults_into_tool_input(
+                tool_name, tool_input, session
+            )
+            update_slots_from_tool_call(
+                session.planning_slots, tool_name, effective_input
+            )
+            result = self._dispatch_tool(tool_name, effective_input, session)
             session.tools_used_this_turn.append(tool_name)
+            self._store_tool_result(tool_name, result, session)
             return {
                 "type": "tool_result",
                 "tool_use_id": tool_use_id,
                 "content": result.model_dump_json(),
             }
         except Exception as e:
+            logger.exception("Tool execution failed: %s", tool_name)
             return {
                 "type": "tool_result",
                 "tool_use_id": tool_use_id,
@@ -114,29 +184,29 @@ class AgentOrchestrator:
         self, tool_name: str, tool_input: dict, session: SessionState
     ):
         """Route a tool call to the correct provider and update session flags."""
-        match tool_name:
-            case "get_route":
-                parsed = RouteInput(**tool_input)
-                result = self.tools.route.get_route(parsed)
-                session.route_fetched = True
-                return result
-            case "find_accommodation":
-                parsed = AccommodationInput(**tool_input)
-                result = self.tools.accommodation.find_accommodation(parsed)
-                session.accommodation_fetched = True
-                return result
-            case "get_weather":
-                parsed = WeatherInput(**tool_input)
-                result = self.tools.weather.get_weather(parsed)
-                session.weather_fetched = True
-                return result
-            case "get_elevation_profile":
-                parsed = ElevationInput(**tool_input)
-                result = self.tools.elevation.get_elevation_profile(parsed)
-                session.elevation_fetched = True
-                return result
-            case _:
-                raise ValueError(f"Unknown tool: {tool_name}")
+        if tool_name not in _TOOL_DISPATCH:
+            raise ValueError(f"Unknown tool: {tool_name}")
+
+        input_model, registry_attr, method_name, session_flag = _TOOL_DISPATCH[tool_name]
+        parsed = input_model(**tool_input)
+        provider = getattr(self.tools, registry_attr)
+        result = getattr(provider, method_name)(parsed)
+
+        if session_flag:
+            setattr(session, session_flag, True)
+
+        return result
+
+    @staticmethod
+    def _store_tool_result(tool_name: str, result, session: SessionState) -> None:
+        """Store structured tool output on the session for the UI to consume."""
+        data = result.model_dump()
+        if tool_name in _ACCUMULATING_TOOLS:
+            existing = session.tool_results_data.get(tool_name, [])
+            existing.append(data)
+            session.tool_results_data[tool_name] = existing
+        else:
+            session.tool_results_data[tool_name] = data
 
     @staticmethod
     def _extract_text(content) -> str:

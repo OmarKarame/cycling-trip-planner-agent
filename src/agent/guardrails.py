@@ -6,7 +6,13 @@ if TYPE_CHECKING:
     from src.agent.session import SessionState
 
 # Tools that require the route to be fetched first.
-_NEEDS_ROUTE = {"find_accommodation", "get_elevation_profile"}
+_NEEDS_ROUTE = {
+    "find_accommodation", "get_elevation_profile",
+    "get_points_of_interest", "estimate_budget", "get_weather"
+}
+
+# Tools that require both route and weather to be checked first.
+_NEEDS_WEATHER = {"find_accommodation"}
 
 
 class ToolGuardrails:
@@ -28,6 +34,12 @@ class ToolGuardrails:
             return False, (
                 f"Cannot use {tool_name} yet. Please fetch the route first "
                 "using get_route before looking up accommodations or elevation."
+            )
+
+        if tool_name in _NEEDS_WEATHER and not session.weather_fetched:
+            return False, (
+                f"Cannot use {tool_name} yet. Please check the weather first "
+                "using get_weather to assess safety before planning accommodations."
             )
 
         return True, None

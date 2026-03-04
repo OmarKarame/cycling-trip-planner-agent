@@ -25,11 +25,13 @@ def _make_mock_response(text: str):
 
 
 class TestChatEndpoint:
-    @patch("src.agent.orchestrator.anthropic.Anthropic")
+    @patch("src.agent.orchestrator.anthropic.AsyncAnthropic")
     def test_new_session_created(self, mock_anthropic_cls, client):
         mock_client = MagicMock()
-        mock_client.messages.create.return_value = _make_mock_response(
-            "Hello! I'd love to help you plan a cycling trip."
+        mock_client.messages.create = AsyncMock(
+            return_value=_make_mock_response(
+                "Hello! I'd love to help you plan a cycling trip."
+            )
         )
         mock_anthropic_cls.return_value = mock_client
 
@@ -41,17 +43,21 @@ class TestChatEndpoint:
         assert len(data["session_id"]) > 0
         assert "Hello" in data["response"]
 
-    @patch("src.agent.orchestrator.anthropic.Anthropic")
+    @patch("src.agent.orchestrator.anthropic.AsyncAnthropic")
     def test_session_persists(self, mock_anthropic_cls, client):
         mock_client = MagicMock()
-        mock_client.messages.create.return_value = _make_mock_response("Response 1")
+        mock_client.messages.create = AsyncMock(
+            return_value=_make_mock_response("Response 1")
+        )
         mock_anthropic_cls.return_value = mock_client
 
         # First request — creates session
         resp1 = client.post("/chat", json={"message": "Hi"})
         session_id = resp1.json()["session_id"]
 
-        mock_client.messages.create.return_value = _make_mock_response("Response 2")
+        mock_client.messages.create = AsyncMock(
+            return_value=_make_mock_response("Response 2")
+        )
 
         # Second request — reuses session
         resp2 = client.post(
@@ -59,10 +65,12 @@ class TestChatEndpoint:
         )
         assert resp2.json()["session_id"] == session_id
 
-    @patch("src.agent.orchestrator.anthropic.Anthropic")
+    @patch("src.agent.orchestrator.anthropic.AsyncAnthropic")
     def test_response_format(self, mock_anthropic_cls, client):
         mock_client = MagicMock()
-        mock_client.messages.create.return_value = _make_mock_response("Test response")
+        mock_client.messages.create = AsyncMock(
+            return_value=_make_mock_response("Test response")
+        )
         mock_anthropic_cls.return_value = mock_client
 
         response = client.post("/chat", json={"message": "Hello"})
@@ -72,6 +80,27 @@ class TestChatEndpoint:
         assert "response" in data
         assert "tools_used" in data
         assert isinstance(data["tools_used"], list)
+
+    @patch("src.agent.orchestrator.anthropic.AsyncAnthropic")
+    def test_expired_session_warns_user(self, mock_anthropic_cls, client):
+        """When a session_id is sent but doesn't exist (e.g. server restart),
+        the response should include a warning about lost context."""
+        mock_client = MagicMock()
+        mock_client.messages.create = AsyncMock(
+            return_value=_make_mock_response("What trip would you like?")
+        )
+        mock_anthropic_cls.return_value = mock_client
+
+        response = client.post(
+            "/chat",
+            json={"message": "add more details", "session_id": "stale-id-123"},
+        )
+
+        data = response.json()
+        assert response.status_code == 200
+        assert "session has expired" in data["response"] or "lost" in data["response"]
+        # A new session_id is issued
+        assert data["session_id"] != "stale-id-123"
 
     def test_missing_message_returns_422(self, client):
         response = client.post("/chat", json={})
