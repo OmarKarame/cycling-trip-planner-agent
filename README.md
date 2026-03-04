@@ -4,7 +4,7 @@ An AI-powered agent that helps cyclists plan multi-day bike trips through natura
 
 ## Link to Video Recording
 
-https://drive.google.com/file/d/1zkBkCdIxlxHCycWWEPDTQsCIY1WcHb67/view?usp=share_link
+https://drive.google.com/file/d/1IB6gwnSfep3wPDwmiIlgR98zxUlCUnN0/view?usp=share_link
 
 ## Quick Start
 
